@@ -1,0 +1,153 @@
+#!/bin/sh
+# AppRun do GParted AppImage
+# 1) Usuário comum -> detecta tema/modo de cor do usuário e re-executa o próprio
+#    AppImage como root (pkexec/sudo), repassando só as variáveis necessárias.
+# 2) Root -> ambiente do AppDir, aplica o tema detectado, inibe automount do
+#    udisks e chama o wrapper oficial "gparted" -> gpartedbin.
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="${APPDIR:-$HERE}"
+SELF="${APPIMAGE:-$HERE/AppRun}"
+
+# ---------------------------------------------------------------------------
+# Detecção de aparência (executada como USUÁRIO, onde há sessão D-Bus/dconf)
+# ---------------------------------------------------------------------------
+detect_appearance() {
+    scheme=""
+    # 1. Portal XDG (GNOME, KDE, COSMIC, Hyprland c/ portal...): 1=dark 2=light
+    if command -v busctl >/dev/null 2>&1; then
+        v=$(timeout 2 busctl --user call org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop \
+            org.freedesktop.portal.Settings ReadOne ss org.freedesktop.appearance color-scheme 2>/dev/null | awk '{print $NF}')
+    elif command -v dbus-send >/dev/null 2>&1; then
+        v=$(timeout 2 dbus-send --session --print-reply --dest=org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop \
+            org.freedesktop.portal.Settings.Read string:org.freedesktop.appearance string:color-scheme 2>/dev/null | tail -n1 | awk '{print $NF}')
+    fi
+    case "$v" in 1) scheme=dark;; 2) scheme=light;; esac
+    # 2. GSettings (GNOME/Cinnamon/MATE/Budgie...)
+    if command -v gsettings >/dev/null 2>&1; then
+        [ -z "$scheme" ] && case "$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)" in
+            *prefer-dark*) scheme=dark;; *prefer-light*) scheme=light;; esac
+        theme=$(gsettings get org.gnome.desktop.interface gtk-theme 2>/dev/null | tr -d "'")
+        icons=$(gsettings get org.gnome.desktop.interface icon-theme 2>/dev/null | tr -d "'")
+    fi
+    # 3. settings.ini do GTK3 (KDE, XFCE, LXQt, WMs)
+    ini="${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/settings.ini"
+    if [ -r "$ini" ]; then
+        [ -z "$theme" ] && theme=$(sed -n 's/^gtk-theme-name *= *//p' "$ini" | head -1)
+        [ -z "$icons" ] && icons=$(sed -n 's/^gtk-icon-theme-name *= *//p' "$ini" | head -1)
+        [ -z "$scheme" ] && grep -Eq '^gtk-application-prefer-dark-theme *= *(1|true)' "$ini" && scheme=dark
+    fi
+    # 4. KDE kdeglobals
+    kg="${XDG_CONFIG_HOME:-$HOME/.config}/kdeglobals"
+    [ -z "$scheme" ] && [ -r "$kg" ] && grep -Eiq '^ColorScheme=.*dark' "$kg" && scheme=dark
+    # 5. Nome do tema
+    [ -z "$scheme" ] && case "$theme" in *[Dd]ark*) scheme=dark;; esac
+    GPARTED_COLOR_SCHEME="${GPARTED_COLOR_SCHEME:-${scheme:-light}}"
+
+    # Localiza tema/ícones do usuário (root não enxerga $HOME do usuário por padrão)
+    GPARTED_USER_THEME_DIR=""; GPARTED_USER_ICONS_DIR=""
+    for d in "${XDG_DATA_HOME:-$HOME/.local/share}/themes" "$HOME/.themes" /usr/local/share/themes /usr/share/themes; do
+        [ -n "$theme" ] && [ -f "$d/$theme/gtk-3.0/gtk.css" ] && { GPARTED_USER_THEME_DIR="$d/$theme"; break; }
+    done
+    for d in "${XDG_DATA_HOME:-$HOME/.local/share}/icons" "$HOME/.icons" /usr/local/share/icons /usr/share/icons; do
+        [ -n "$icons" ] && [ -f "$d/$icons/index.theme" ] && { GPARTED_USER_ICONS_DIR="$d/$icons"; break; }
+    done
+}
+
+if [ "$(id -u)" != "0" ] && [ "x$GPARTED_NO_ELEVATE" != "x1" ]; then
+    detect_appearance
+    ENVV="DISPLAY=${DISPLAY} XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}"
+    ENVV="$ENVV WAYLAND_DISPLAY=${WAYLAND_DISPLAY} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+    ENVV="$ENVV LANG=${LANG:-C.UTF-8} LANGUAGE=${LANGUAGE} GPARTED_PREFER_HOST_TOOLS=${GPARTED_PREFER_HOST_TOOLS}"
+    ENVV="$ENVV APPIMAGE_EXTRACT_AND_RUN=${APPIMAGE_EXTRACT_AND_RUN} GPARTED_THEME=${GPARTED_THEME}"
+    ENVV="$ENVV GPARTED_COLOR_SCHEME=${GPARTED_COLOR_SCHEME}"
+    ENVV="$ENVV GPARTED_USER_THEME_DIR=${GPARTED_USER_THEME_DIR} GPARTED_USER_ICONS_DIR=${GPARTED_USER_ICONS_DIR}"
+    GRANTED=no
+    if [ -n "$DISPLAY" ] && command -v xhost >/dev/null 2>&1; then
+        if ! xhost | grep -qi 'SI:localuser:root$'; then xhost +SI:localuser:root >/dev/null && GRANTED=yes; fi
+    fi
+    if command -v pkexec >/dev/null 2>&1 && { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; }; then
+        pkexec env $ENVV "$SELF" "$@"; st=$?
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo env $ENVV "$SELF" "$@"; st=$?
+    else
+        echo "GParted precisa de root. Instale pkexec (polkit) ou sudo, ou execute como root." >&2; st=1
+    fi
+    [ "$GRANTED" = yes ] && xhost -SI:localuser:root >/dev/null 2>&1
+    exit $st
+fi
+# Execução direta como root (sem passar pela fase de usuário): tenta detectar mesmo assim
+[ -z "$GPARTED_COLOR_SCHEME" ] && detect_appearance
+
+# ---------------------------------------------------------------------------
+# Ambiente autocontido (root)
+# ---------------------------------------------------------------------------
+if [ "x$GPARTED_PREFER_HOST_TOOLS" = "x1" ]; then
+    export PATH="$PATH:$APPDIR/usr/bin"
+else
+    export PATH="$APPDIR/usr/bin:$PATH"
+fi
+# NÃO exportar LD_LIBRARY_PATH: os binários já têm RUNPATH=$ORIGIN/../lib e
+# exportá-lo quebraria shells/ferramentas do host (ex.: libreadline do bash).
+export GPARTED_LOCALEDIR="$APPDIR/usr/share/locale"
+export NO_AT_BRIDGE=1
+[ "$(id -u)" = "0" ] && export HOME=/root
+
+# --- Tema: usa o tema do usuário se existir; senão Adwaita (claro/escuro) ---
+TMPD=$(mktemp -d /tmp/gparted-appimage.XXXXXX)
+VARIANT=""; [ "$GPARTED_COLOR_SCHEME" = dark ] && VARIANT=":dark"
+THEME="Adwaita$VARIANT"
+if [ "x$GPARTED_THEME" != "xadwaita" ] && [ -n "$GPARTED_USER_THEME_DIR" ] && [ -d "$GPARTED_USER_THEME_DIR/gtk-3.0" ]; then
+    mkdir -p "$TMPD/share/themes"
+    ln -s "$GPARTED_USER_THEME_DIR" "$TMPD/share/themes/"
+    tn=$(basename "$GPARTED_USER_THEME_DIR")
+    THEME="$tn"
+    # tema claro com variante escura embutida (gtk-dark.css)
+    case "$tn" in *[Dd]ark*) ;; *)
+        [ -n "$VARIANT" ] && [ -f "$GPARTED_USER_THEME_DIR/gtk-3.0/gtk-dark.css" ] && THEME="$tn:dark";;
+    esac
+fi
+[ -n "$GPARTED_THEME" ] && [ "x$GPARTED_THEME" != "xadwaita" ] && THEME="$GPARTED_THEME"
+export APPIMAGE_GTK_THEME="$THEME"
+mkdir -p "$TMPD/config/gtk-3.0"
+{
+    echo "[Settings]"
+    [ "$GPARTED_COLOR_SCHEME" = dark ] && echo "gtk-application-prefer-dark-theme=1"
+    if [ -n "$GPARTED_USER_ICONS_DIR" ] && [ -d "$GPARTED_USER_ICONS_DIR" ]; then
+        mkdir -p "$TMPD/share/icons"; ln -s "$GPARTED_USER_ICONS_DIR" "$TMPD/share/icons/"
+        echo "gtk-icon-theme-name=$(basename "$GPARTED_USER_ICONS_DIR")"
+    fi
+} > "$TMPD/config/gtk-3.0/settings.ini"
+export XDG_CONFIG_HOME="$TMPD/config"
+
+[ -f "$APPDIR/apprun-hooks/linuxdeploy-plugin-gtk.sh" ] && . "$APPDIR/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+# depois do hook (que coloca /usr/share do host antes): tema do usuário tem prioridade
+export XDG_DATA_DIRS="$TMPD/share:$XDG_DATA_DIRS"
+# Deixa o GTK escolher Wayland nativo quando disponível (fallback X11)
+if [ -n "$WAYLAND_DISPLAY" ]; then export GDK_BACKEND=wayland,x11; else export GDK_BACKEND=x11; fi
+
+# --- Inibe automount do udisks2 durante a sessão ---------------------------
+# O wrapper oficial só usa /usr/lib*/udisks2/udisks2-inhibit, que várias distros
+# (ex.: Arch) não instalam. Sem isso o udisks remonta o dispositivo no meio da
+# operação -> "Device or resource busy". Replica o que o udisks2-inhibit faz.
+INHIBIT_RULE=""
+if [ "$(id -u)" = "0" ] && [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1 \
+   && ! [ -x /usr/libexec/udisks2/udisks2-inhibit ] && ! [ -x /usr/lib/udisks2/udisks2-inhibit ]; then
+    INHIBIT_RULE=/run/udev/rules.d/90-gparted-appimage-udisks-inhibit.rules
+    mkdir -p /run/udev/rules.d
+    echo 'SUBSYSTEM=="block", ENV{UDISKS_IGNORE}="1"' > "$INHIBIT_RULE"
+    udevadm control --reload 2>/dev/null
+    udevadm trigger --subsystem-match=block --action=change 2>/dev/null
+fi
+
+cleanup() {
+    if [ -n "$INHIBIT_RULE" ]; then
+        rm -f "$INHIBIT_RULE"
+        udevadm control --reload 2>/dev/null
+        udevadm trigger --subsystem-match=block --action=change 2>/dev/null
+    fi
+    rm -rf "$TMPD"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+"$APPDIR/usr/bin/gparted" "$@"
